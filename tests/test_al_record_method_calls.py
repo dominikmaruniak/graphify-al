@@ -20,11 +20,43 @@ from graphify.extract import extract  # noqa: E402
 
 _TABLE = """table 50100 "Widget Line"
 {
-    fields { field(1; "No."; Code[20]) { } }
+    fields
+    {
+        field(1; "No."; Code[20])
+        {
+            trigger OnValidate()
+            var
+                WidgetPost: Codeunit "Widget Post";
+            begin
+                WidgetPost.Post();
+            end;
+        }
+    }
 
     procedure InitQty()
     begin
     end;
+}
+"""
+
+_PAGE = """page 50103 "Widget Lines"
+{
+    SourceTable = "Widget Line";
+
+    actions
+    {
+        area(Processing)
+        {
+            action(Recalc)
+            {
+                trigger OnAction()
+                begin
+                    Rec.InitQty();
+                    Rec.Modify();
+                end;
+            }
+        }
+    }
 }
 """
 
@@ -60,7 +92,7 @@ _CODEUNIT = """codeunit 50101 "Widget Post"
 def graph(tmp_path: Path) -> dict:
     files = []
     for name, src in (("WidgetLine.Table.al", _TABLE), ("WidgetLineExt.TableExt.al", _TABLE_EXT),
-                      ("WidgetPost.Codeunit.al", _CODEUNIT)):
+                      ("WidgetPost.Codeunit.al", _CODEUNIT), ("WidgetLines.Page.al", _PAGE)):
         (tmp_path / name).write_text(src, encoding="utf-8")
         files.append(tmp_path / name)
     return extract(files, cache_root=tmp_path)
@@ -98,3 +130,20 @@ def test_member_of_table_outside_corpus_becomes_stub(graph):
     calls = _calls_from_post(graph)
     assert "Customer.MyCustomerHelper" in calls
     assert "Customer.Get" not in calls
+
+
+def _targets_from(g: dict, source_id_part: str) -> set[str]:
+    labels = {n["id"]: n["label"] for n in g["nodes"]}
+    return {labels.get(e["target"], e["target"]) for e in g["edges"]
+            if e["relation"] == "calls" and e["source"].endswith(source_id_part)}
+
+
+def test_field_trigger_cross_object_call(graph):
+    """A field's OnValidate is a nested trigger; its codeunit calls were dropped."""
+    assert ".Post()" in _targets_from(graph, "_table_widget_line_no_onvalidate")
+
+
+def test_page_action_rec_call_resolves_to_source_table(graph):
+    targets = _targets_from(graph, "_recalc_onaction")
+    assert ".InitQty()" in targets
+    assert not any("modify" in t.lower() for t in targets)

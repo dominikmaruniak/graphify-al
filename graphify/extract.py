@@ -6082,6 +6082,23 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
                 collect_vars(c, obj_vars)
         uses: set = {v for v in obj_vars.values() if v[0] in _AL_USES_CLASSES}
 
+        # Rec/xRec: the record an object's own code runs against -- the table
+        # itself, a tableextension's base table, a page's SourceTable -- so
+        # `Rec.DoThing()` resolves like any other Record-typed receiver. Added
+        # after `uses` so an object never gains a dependency on its own record.
+        rec_table = None
+        if obj.type == "table_declaration":
+            nn = obj.child_by_field_name("name") or next(
+                (c for c in obj.children if c.type in ("identifier", "quoted_identifier")), None)
+            rec_table = _al_strip_quotes(text(nn)) if nn is not None else None
+        elif obj.type == "tableextension_declaration" and base is not None:
+            rec_table = _al_strip_quotes(text(base))
+        elif obj.type == "page_declaration":
+            rec_table = _al_page_source_table(body)
+        if rec_table:
+            for k in ("rec", "xrec"):
+                obj_vars.setdefault(k, ("record", rec_table))
+
         # Page `usercontrol(<ctrl>; <AddIn>)`: a page->add-in usage edge, plus a
         # control-name -> add-in map so `CurrPage.<ctrl>.<proc>()` calls resolve to
         # the add-in's procedure (#41). The two identifiers inside the section are
@@ -6123,11 +6140,33 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
                 for pc in c.children:
                     if pc.type in ("parameter_list", "var_section"):
                         collect_vars(pc, vm)
-                uses |= {v for v in vm.values() if v[0] in _AL_USES_CLASSES}
+                uses |= {v for k, v in vm.items()
+                         if v[0] in _AL_USES_CLASSES and k not in ("rec", "xrec")}
                 pbody = c.child_by_field_name("body")
                 if pbody is not None:
                     walk_calls(pbody, proc_line, vm, usercontrols)
             pending = []
+
+        # Triggers nested in members -- a field's OnValidate, a page action's
+        # OnAction, a page field's OnValidate -- run the same code as procedures;
+        # walk their calls too, attributed to the trigger's own line (its node).
+        def walk_nested_triggers(n) -> None:
+            for c in n.children:
+                if c.type == "trigger_declaration":
+                    vm = dict(obj_vars)
+                    for pc in c.children:
+                        if pc.type in ("parameter_list", "var_section"):
+                            collect_vars(pc, vm)
+                    tbody = c.child_by_field_name("body")
+                    if tbody is not None:
+                        walk_calls(tbody, line(c), vm, usercontrols)
+                elif c.type not in ("procedure", "interface_procedure"):
+                    walk_nested_triggers(c)
+
+        for c in body.children:
+            if c.type not in ("procedure", "trigger_declaration", "interface_procedure",
+                              "attribute_item", "var_section"):
+                walk_nested_triggers(c)
 
         if _AL_EMIT_USES:
             for _cls, name in uses:
