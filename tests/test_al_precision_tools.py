@@ -26,7 +26,13 @@ _TABLE = """table 50100 "Widget Line"
 {
     fields
     {
-        field(1; "No."; Code[20]) { }
+        field(1; "No."; Code[20])
+        {
+            trigger OnValidate()
+            begin
+                InitQty();
+            end;
+        }
         field(15; Quantity; Decimal)
         {
             trigger OnValidate()
@@ -151,6 +157,14 @@ def test_compact_neighbors_prints_foreign_callers_as_full_paths(graph):
     assert 'called by (1): Table 50100 "Widget Line".OnInsert' in out
 
 
+def test_member_names_with_dots_are_quoted_and_round_trip(graph):
+    """`No.` must print as `."No.".OnValidate` -- `.No..OnValidate` is unparseable."""
+    out = _call(graph, "bcatlas_get_neighbors", {"label": '"Widget Line".InitQty', "format": "compact"})
+    assert '."No.".OnValidate' in out
+    body = _call(graph, "bcatlas_get_procedure_body", {"label": '"Widget Line"."No.".OnValidate'})
+    assert body.startswith("trigger OnValidate()")
+
+
 def test_full_format_stays_the_default_without_precision_mode(graph, monkeypatch):
     monkeypatch.delenv("GRAPHIFY_AL_PRECISION", raising=False)
     out = _call(graph, "bcatlas_get_neighbors", {"label": '"Widget Line".InitQty'})
@@ -178,7 +192,7 @@ def test_with_location_prefixes_path_file_and_range(graph):
 def test_outline_summary_counts(graph):
     out = _call(graph, "bcatlas_get_outline", {"label": 'Table "Widget Line"'})
     assert out.splitlines()[0].startswith('table 50100 "Widget Line"')
-    assert "3 procedures, 1 event publishers, 2 fields (1 with triggers), 1 object triggers, 1 member triggers" in out
+    assert "3 procedures, 1 event publishers, 2 fields (2 with triggers), 1 object triggers, 2 member triggers" in out
     assert "trigger OnInsert()" in out
 
 

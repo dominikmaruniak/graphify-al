@@ -2135,7 +2135,14 @@ def _build_server(
             ),
             types.Tool(
                 name="bcatlas_get_neighbors",
-                description="Get all direct neighbors of a node with edge details.",
+                description=(
+                    "Direct neighbors of a node: what it calls, who calls it, which"
+                    " subscribers handle an event, which triggers call a procedure."
+                    " Answers 'who calls X' / 'what does X call' / 'who subscribes to"
+                    " event X' in one call. Calls are resolved statically (typed"
+                    " Codeunit/Record/Interface variables, Rec, Codeunit.Run); dynamic"
+                    " dispatch is not visible."
+                ),
                 inputSchema={
                     "type": "object",
                     "properties": {
@@ -2173,7 +2180,8 @@ def _build_server(
                 description=(
                     "Exact, full source text of one procedure/trigger, re-read"
                     " from the real source file (not the index) -- signature,"
-                    " var declarations, and every line of the body. Errors if"
+                    " var declarations, and every line of the body. The cheapest"
+                    " way to read one member of a large object. Errors if"
                     " the node isn't inside a procedure/trigger; use"
                     " bcatlas_get_object_source for object-level nodes."
                 ),

@@ -61,7 +61,14 @@ def al_expected_name(G: nx.Graph, nid: str) -> str | None:
     `Quantity` for a field). Object and file nodes return None.
 
     source_lookup verifies the declaration it finds against this path, so a file
-    that drifted since the graph was built never returns another symbol's text."""
+    that drifted since the graph was built never returns another symbol's text.
+    Names may themselves contain dots (`No.`); use al_member_parts to display."""
+    parts = al_member_parts(G, nid)
+    return ".".join(parts) if parts else None
+
+
+def al_member_parts(G: nx.Graph, nid: str) -> list[str] | None:
+    """Member path segments, outermost first: ["No.", "OnValidate"]."""
     label = _label(G, nid)
     if not label.startswith("."):
         return None
@@ -78,7 +85,7 @@ def al_expected_name(G: nx.Graph, nid: str) -> str | None:
             break
         parts.append(_al_bare_member(_label(G, owner)))
         current = owner
-    return ".".join(reversed(parts))
+    return list(reversed(parts))
 
 
 def al_object_of(G: nx.Graph, nid: str) -> str | None:
@@ -111,12 +118,14 @@ def al_symbol_path(G: nx.Graph, nid: str) -> str:
     ref = _object_ref(_label(G, obj))
     if obj == nid:
         return ref
-    member = al_expected_name(G, nid)
-    return f"{ref}.{_quote_path(member)}" if member else ref
+    parts = al_member_parts(G, nid)
+    return f"{ref}.{_quote_parts(parts)}" if parts else ref
 
 
-def _quote_path(member: str) -> str:
-    return ".".join(f'"{p}"' if re.search(r"[^\w]", p) else p for p in member.split("."))
+def _quote_parts(parts: list[str]) -> str:
+    """Join member segments, quoting any that is not a plain identifier, so a
+    field like `No.` renders as `"No."` and the path parses back unambiguously."""
+    return ".".join(f'"{p}"' if re.search(r"\W", p) else p for p in parts)
 
 
 def parse_symbol_path(text: str) -> tuple[str | None, int | None, str, list[str]] | None:
@@ -207,9 +216,9 @@ def compact_neighbors(G: nx.Graph, nid: str, relation_filter: str = "",
 
     def ref(other: str) -> str:
         if seed_obj is not None and al_object_of(G, other) == seed_obj and other != seed_obj:
-            member = al_expected_name(G, other)
-            if member:
-                return "." + _quote_path(member)
+            parts = al_member_parts(G, other)
+            if parts:
+                return "." + _quote_parts(parts)
         return al_symbol_path(G, other)
 
     groups: dict[str, list[str]] = {}
