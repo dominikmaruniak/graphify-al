@@ -5249,6 +5249,25 @@ _AL_OBJ_TYPE_RE = re.compile(
 _AL_CODEUNIT_CLASSES = frozenset({"codeunit"})
 _AL_USES_CLASSES = frozenset({"record", "page", "report", "query", "xmlport"})
 
+# Built-in Record methods. A call on a Record-typed variable whose member is one of
+# these is a platform call, not a procedure of the table, and gets no `calls` edge;
+# any other member resolves to the table's (or a tableextension's) procedure.
+_AL_RECORD_BUILTINS = frozenset(m.lower() for m in (
+    "AddLink", "AddLoadFields", "AreFieldsLoaded", "Ascending", "CalcFields", "CalcSums",
+    "ChangeCompany", "ClearMarks", "Consistent", "Copy", "CopyFilter", "CopyFilters",
+    "CopyLinks", "Count", "CountApprox", "CurrentCompany", "CurrentKey", "Delete",
+    "DeleteAll", "DeleteLink", "DeleteLinks", "FieldActive", "FieldCaption", "FieldError",
+    "FieldName", "FieldNo", "FilterGroup", "Find", "FindFirst", "FindLast", "FindSet",
+    "Get", "GetBySystemId", "GetFilter", "GetFilters", "GetPosition", "GetRangeMax",
+    "GetRangeMin", "GetView", "HasFilter", "HasLinks", "Init", "Insert", "IsEmpty",
+    "IsTemporary", "LoadFields", "LockTable", "Mark", "MarkedOnly", "Modify", "ModifyAll",
+    "Next", "ReadConsistency", "ReadIsolation", "ReadPermission", "RecordId", "RecordLevelLocking",
+    "Relation", "Rename", "Reset", "SecurityFiltering", "SetAscending", "SetAutoCalcFields",
+    "SetBaseLoadFields", "SetCurrentKey", "SetFilter", "SetLoadFields", "SetPermissionFilter",
+    "SetPosition", "SetRange", "SetRecFilter", "SetView", "SystemId", "TableCaption",
+    "TableName", "TestField", "TransferFields", "Truncate", "Validate", "WritePermission",
+))
+
 # Built-in indirect dispatch: Codeunit.Run(Codeunit::"X"), Page.RunModal(Page::"Y"),
 # Report.Run(Report::"Z"). The object keyword parses as a `keyword_identifier`.
 _AL_RUN_KEYWORDS = frozenset({"codeunit", "page", "report"})
@@ -5549,6 +5568,14 @@ def _al_collect_facts(tree, source: bytes) -> list[dict]:
                             if srctbl:
                                 facts.append({"kind": "transfers_to", "src_line": proc_line,
                                               "src_name": srctbl, "target": hit[1]})
+                        elif (hit and hit[0] == "record"
+                              and text(mem).lower() not in _AL_RECORD_BUILTINS):
+                            # MyRec.DoThing() on a Record-typed variable: a call into
+                            # a procedure of that table or one of its tableextensions.
+                            # Resolution keeps it only when such a procedure exists.
+                            facts.append({"kind": "calls", "src_line": proc_line,
+                                          "target": hit[1], "method": text(mem),
+                                          "target_kind": "table", "record_call": True})
                     elif (ob.type == "keyword_identifier"
                           and text(ob).lower() in _AL_RUN_KEYWORDS
                           and text(mem).lower() in _AL_RUN_METHODS):
@@ -6605,6 +6632,13 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
     # every object that `implements "IFoo"`. Pre-index implementor node ids by
     # interface name (both `implements` clauses and enum `Implementation` bindings).
     implementors_by_iface: dict[str, list[str]] = {}
+    # Record method calls resolve against the table and every tableextension of
+    # it, so index tables by name and tableextensions by their base table.
+    table_ids_by_name: dict[str, list[str]] = {
+        key: [i for i in ids if objnode_by_id.get(i, {}).get("al_object_type") == "table"]
+        for key, ids in obj_ids_by_name.items()
+    }
+    ext_ids_by_base: dict[str, list[str]] = {}
     for result in per_file:
         if not isinstance(result, dict):
             continue
@@ -6620,6 +6654,12 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
                 except ValueError:
                     pass
         for f in facts:
+            if f.get("kind") == "extends":
+                src = l2n.get(f.get("src_line"))
+                if src and objnode_by_id.get(src, {}).get("al_object_type") == "tableextension":
+                    ext_ids_by_base.setdefault(
+                        _al_strip_quotes(str(f.get("target", ""))).lower(), []).append(src)
+                continue
             if f.get("kind") != "implements":
                 continue
             iface = _al_strip_quotes(str(f.get("target", ""))).lower()
@@ -6834,7 +6874,20 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
                     # navigates_to RunObject keyword (page/report/...) types the stub (#28).
                     stub_type = f.get("target_kind")
                 obj_id = obj_by_name.get(key)
-                if f["kind"] == "calls":
+                if f["kind"] == "calls" and f.get("record_call"):
+                    meth_raw = str(f.get("method", "")).strip()
+                    owners = table_ids_by_name.get(key, []) + ext_ids_by_base.get(key, [])
+                    tgt = next((proc_by_objmeth[(o, meth_raw.lower())] for o in owners
+                                if (o, meth_raw.lower()) in proc_by_objmeth), None)
+                    if tgt is None:
+                        if table_ids_by_name.get(key):
+                            # In-corpus table with no such procedure: a platform
+                            # method missing from the built-in list, or a member
+                            # of an extension outside the corpus. No guessed edge.
+                            continue
+                        tgt = ensure_external(
+                            f"{_al_strip_quotes(tname)}.{meth_raw}", src_qualifier, "table")
+                elif f["kind"] == "calls":
                     meth_raw = str(f.get("method", "")).strip()
                     meth = meth_raw.lower()
                     if obj_id:
