@@ -48,6 +48,12 @@ _LABEL_DESCRIPTION = (
     ' or Codeunit "Sales-Post".PostSalesLine'
 )
 
+# Tools an agent needs for nearly every AL question; loaded up front in precision mode.
+_AL_CORE_TOOLS = frozenset({
+    "bcatlas_resolve_node", "bcatlas_get_neighbors", "bcatlas_get_procedure_body",
+    "bcatlas_get_signature", "bcatlas_get_outline",
+})
+
 _ROUTING_SCHEMA_PROPERTIES: dict = {
     "country": {
         "type": "string",
@@ -2347,6 +2353,11 @@ def _build_server(
                     "this server was started with."
                 ),
             }
+            # Claude Code defers MCP tools behind a ToolSearch call, which costs
+            # every session one extra turn. In precision mode the core lookup
+            # tools ask to be loaded up front; the rest stay deferred.
+            if precision_mode() and _t.name in _AL_CORE_TOOLS:
+                _t.meta = {**(_t.meta or {}), "anthropic/alwaysLoad": True}
         return _tools
 
     def _tool_query_graph(arguments: dict) -> str:

@@ -102,7 +102,7 @@ def graph(tmp_path: Path) -> str:
     return str(gp)
 
 
-def _call(graph_path: str, name: str, arguments: dict) -> str:
+def _rpc(graph_path: str, method: str, params: dict) -> dict:
     app = serve_mod._build_http_app(graph_path, json_response=True)
     with TestClient(app, base_url="http://127.0.0.1") as client:
         init = client.post("/mcp", headers=_H, json={
@@ -112,9 +112,13 @@ def _call(graph_path: str, name: str, arguments: dict) -> str:
         headers = {**_H, "mcp-session-id": init.headers["mcp-session-id"]}
         client.post("/mcp", headers=headers, json={"jsonrpc": "2.0", "method": "notifications/initialized"})
         resp = client.post("/mcp", headers=headers, json={
-            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-            "params": {"name": name, "arguments": arguments}})
-        return "\n".join(c["text"] for c in resp.json()["result"]["content"])
+            "jsonrpc": "2.0", "id": 2, "method": method, "params": params})
+        return resp.json()["result"]
+
+
+def _call(graph_path: str, name: str, arguments: dict) -> str:
+    result = _rpc(graph_path, "tools/call", {"name": name, "arguments": arguments})
+    return "\n".join(c["text"] for c in result["content"])
 
 
 # --- symbol paths -------------------------------------------------------------
@@ -175,6 +179,23 @@ def test_precision_mode_makes_compact_the_default(graph, monkeypatch):
     monkeypatch.setenv("GRAPHIFY_AL_PRECISION", "1")
     out = _call(graph, "bcatlas_get_neighbors", {"label": '"Widget Line".InitQty'})
     assert out.startswith('Table 50100 "Widget Line".InitQty')
+
+
+def _always_loaded(graph) -> set[str]:
+    tools = _rpc(graph, "tools/list", {})["tools"]
+    return {t["name"] for t in tools if (t.get("_meta") or {}).get("anthropic/alwaysLoad")}
+
+
+def test_precision_mode_loads_core_tools_up_front(graph, monkeypatch):
+    monkeypatch.setenv("GRAPHIFY_AL_PRECISION", "1")
+    assert _always_loaded(graph) == {
+        "bcatlas_resolve_node", "bcatlas_get_neighbors", "bcatlas_get_procedure_body",
+        "bcatlas_get_signature", "bcatlas_get_outline"}
+
+
+def test_default_mode_leaves_every_tool_deferred(graph, monkeypatch):
+    monkeypatch.delenv("GRAPHIFY_AL_PRECISION", raising=False)
+    assert _always_loaded(graph) == set()
 
 
 # --- body location header -------------------------------------------------------
