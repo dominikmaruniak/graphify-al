@@ -186,17 +186,30 @@ def get_signature(source_path: Path, source_location: str | None,
     return _header_text(node, spans["source"])
 
 
-def get_procedure_body(source_path: Path, source_location: str | None,
-                       expected_name: str | None = None) -> str:
+def _lines(node) -> tuple[int, int]:
+    return node.start_point[0] + 1, node.end_point[0] + 1
+
+
+def get_procedure_body_located(source_path: Path, source_location: str | None,
+                               expected_name: str | None = None
+                               ) -> tuple[str, list[tuple[int, int]]]:
+    """get_procedure_body plus the 1-based (start, end) line range of each
+    declaration returned, so a caller can Read/Edit exactly those lines."""
     spans = _resolve_spans(source_path, source_location, expected_name)
     if len(spans["group"]) > 1:
-        return _group_note(spans, expected_name) + "\n\n".join(
+        text = _group_note(spans, expected_name) + "\n\n".join(
             _full_text(n, spans["source"]) for n in spans["group"])
+        return text, [_lines(n) for n in spans["group"]]
     if spans["function"] is None:
         raise SourceLookupError(
             "This node isn't inside a procedure/trigger -- use get_object_source instead."
         )
-    return _full_text(spans["function"], spans["source"])
+    return _full_text(spans["function"], spans["source"]), [_lines(spans["function"])]
+
+
+def get_procedure_body(source_path: Path, source_location: str | None,
+                       expected_name: str | None = None) -> str:
+    return get_procedure_body_located(source_path, source_location, expected_name)[0]
 
 
 def get_object_source(source_path: Path, source_location: str | None,
@@ -207,3 +220,114 @@ def get_object_source(source_path: Path, source_location: str | None,
     # source_location sits above any declaration (e.g. the file-level node) --
     # fall back to the whole file, which is what a W1-28 .al file always is.
     return spans["source"].decode("utf-8", errors="replace")
+
+
+# ── outline: a table of contents of one AL object, with line ranges ────────────
+
+_OUTLINE_SECTIONS = ("summary", "procedures", "triggers", "fields", "events", "all")
+
+
+def _one_line(text: str, limit: int = 160) -> str:
+    s = " ".join(text.split())
+    return s if len(s) <= limit else s[: limit - 3] + "..."
+
+
+def _publisher_kind(node, source: bytes) -> str | None:
+    sib = node.prev_named_sibling
+    while sib is not None and sib.type == "attribute_item":
+        low = source[sib.start_byte:sib.end_byte].decode("utf-8", errors="replace").lower()
+        if "integrationevent" in low:
+            return "integration"
+        if "businessevent" in low:
+            return "business"
+        sib = sib.prev_named_sibling
+    return None
+
+
+def _outline_entries(obj, source: bytes) -> tuple[list[dict], list[dict]]:
+    """(declarations, fields) of one object, in file order."""
+    decls: list[dict] = []
+    fields: list[dict] = []
+
+    def walk(node, field: dict | None) -> None:
+        if node.type in _AL_CONFIG.function_types:
+            start, end = _lines(node)
+            decls.append({
+                "name": _qualified_name(node, source) or "?",
+                "kind": "trigger" if node.type == "trigger_declaration" else "procedure",
+                "member_trigger": field is not None,
+                "event": _publisher_kind(node, source),
+                "sig": _one_line(_header_text(node, source)),
+                "start": start, "end": end,
+            })
+            if field is not None:
+                field["triggers"].append(f"{decls[-1]['name'].rsplit('.', 1)[-1]} L{start}-{end}")
+            return
+        if node.type == "field_declaration":
+            start, end = _lines(node)
+            first = source[node.start_byte:node.end_byte].decode("utf-8", errors="replace").split("\n", 1)[0]
+            field = {"name": _al_strip_quotes(_al_member_name(node, source) or "?"),
+                     "sig": _one_line(first), "start": start, "end": end, "triggers": []}
+            fields.append(field)
+        for child in node.children:
+            walk(child, field)
+
+    for child in obj.children:
+        walk(child, None)
+    return decls, fields
+
+
+def get_outline(source_path: Path, source_location: str | None,
+                expected_name: str | None = None, pattern: str | None = None,
+                section: str = "summary", max_items: int = 300) -> str:
+    """Table of contents of the AL object at `source_location`: its procedures,
+    triggers, fields and event publishers with 1-based line ranges, read from the
+    current file (so it is never stale). `summary` gives counts and object
+    triggers only; `pattern` filters by name across every section."""
+    spans = _resolve_spans(source_path, source_location, expected_name)
+    obj, source = spans["object"], spans["source"]
+    if obj is None:
+        raise SourceLookupError("No AL object declaration found at that location.")
+    section = (section or "summary").lower()
+    if section not in _OUTLINE_SECTIONS:
+        raise SourceLookupError(f"Unknown section '{section}'; use one of {', '.join(_OUTLINE_SECTIONS)}.")
+    if pattern and section == "summary":
+        section = "all"
+    decls, fields = _outline_entries(obj, source)
+    start, end = _lines(obj)
+    header = _one_line(_header_text(obj, source).split("\n", 1)[0])
+    procs = [d for d in decls if d["kind"] == "procedure" and not d["event"]]
+    events = [d for d in decls if d["event"]]
+    obj_triggers = [d for d in decls if d["kind"] == "trigger" and not d["member_trigger"]]
+    member_triggers = [d for d in decls if d["member_trigger"]]
+    out = [f"{header}  [{source_path.name} L{start}-{end}, {end - start + 1} lines]",
+           f"{len(procs)} procedures, {len(events)} event publishers, "
+           f"{len(fields)} fields ({sum(1 for f in fields if f['triggers'])} with triggers), "
+           f"{len(obj_triggers)} object triggers, {len(member_triggers)} member triggers"]
+
+    def keep(name: str) -> bool:
+        return not pattern or pattern.lower() in name.lower()
+
+    rows: list[str] = []
+    if section == "summary":
+        rows += [f"L{d['start']}-{d['end']} {d['sig']}" for d in obj_triggers]
+        out += rows
+        out.append("Sections: procedures | triggers | fields | events | all; or pass pattern=<name part>.")
+        return "\n".join(out)
+    if section in ("triggers", "all"):
+        rows += [f"L{d['start']}-{d['end']} trigger {d['name']}"
+                 for d in obj_triggers + member_triggers if keep(d["name"])]
+    if section in ("procedures", "all"):
+        rows += [f"L{d['start']}-{d['end']} {d['sig']}" for d in procs if keep(d["name"])]
+    if section in ("fields", "all"):
+        rows += [f"L{f['start']}-{f['end']} {f['sig']}"
+                 + (f"  [{', '.join(f['triggers'])}]" if f["triggers"] else "")
+                 for f in fields if keep(f["name"])]
+    if section in ("events", "all"):
+        rows += [f"L{d['start']}-{d['end']} [{d['event']} event] {d['sig']}"
+                 for d in events if keep(d["name"])]
+    if not rows:
+        rows = [f"(nothing in section '{section}'" + (f" matching '{pattern}')" if pattern else ")")]
+    if len(rows) > max_items:
+        rows = rows[:max_items] + [f"... +{len(rows) - max_items} more (narrow with pattern)"]
+    return "\n".join(out + rows)

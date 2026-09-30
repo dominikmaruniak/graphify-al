@@ -15,6 +15,9 @@ import networkx as nx
 from networkx.readwrite import json_graph
 from graphify.security import sanitize_label, check_graph_file_size_cap, validate_graph_path
 from graphify.build import edge_data, edge_datas
+from graphify.al_precision import (  # noqa: F401 -- al_expected_name is re-exported
+    al_expected_name, al_symbol_path, compact_neighbors, precision_mode, resolve_symbol_path,
+)
 from graphify.paths import default_graph_json as _default_graph_json
 from graphify import source_lookup
 
@@ -40,6 +43,11 @@ except ImportError:
 # Shared JSON-schema fragment merged into every bcatlas_* tool's
 # inputSchema below -- one definition, ten call sites, so the wording
 # never drifts between tools.
+_LABEL_DESCRIPTION = (
+    'Node label, node ID, or AL symbol path such as Table 37 "Sales Line".Quantity.OnValidate'
+    ' or Codeunit "Sales-Post".PostSalesLine'
+)
+
 _ROUTING_SCHEMA_PROPERTIES: dict = {
     "country": {
         "type": "string",
@@ -1675,43 +1683,26 @@ def _find_node_by_global_id(G: nx.Graph, global_id: str) -> list[str]:
     ]
 
 
-def _al_bare_member(label: str) -> str:
-    """`.InitQty()` -> `InitQty`, `."Quantity (Base)"` -> `Quantity (Base)`."""
-    s = label[1:] if label.startswith(".") else label
-    if s.endswith("()"):
-        s = s[:-2]
-    s = s.strip()
-    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
-        s = s[1:-1]
-    return s
+def _al_path_lookup(G: nx.Graph, label: str) -> tuple[list[str] | None, str | None]:
+    """Resolve `label` as an AL symbol path (`Table "Sales Line".Quantity.OnValidate`).
 
-
-def al_expected_name(G: nx.Graph, nid: str) -> str | None:
-    """`Member.Name` path of an AL procedure/trigger node, built from the graph
-    (`Quantity.OnValidate` for a field trigger, `InitQty` for a procedure).
-
-    source_lookup verifies the declaration it finds at the stored line against
-    this path and relocates or refuses on a mismatch, so a file that drifted
-    since the graph was built never returns another symbol's text. Object and
-    file nodes return None -- any line inside the one object of an AL file
-    resolves to that object."""
-    label = str(G.nodes[nid].get("label") or "")
-    if not label.startswith("."):
-        return None
-    parts = [_al_bare_member(label)]
-    current = nid
-    for _ in range(8):
-        owner = next(
-            (p for p in G.predecessors(current)
-             if edge_data(G, p, current).get("relation") in ("contains", "trigger")
-             and str(G.nodes[p].get("label") or "").startswith(".")),
-            None,
-        )
-        if owner is None:
-            break
-        parts.append(_al_bare_member(str(G.nodes[owner].get("label"))))
-        current = owner
-    return ".".join(reversed(parts))
+    Returns (None, None) when `label` is not a symbol path, so the caller falls
+    back to the ordinary fuzzy label lookup; ([nid], None) on a unique match;
+    ([], message) on a miss or an ambiguous path."""
+    try:
+        hits = resolve_symbol_path(G, label)
+    except Exception:  # noqa: BLE001 -- a malformed path falls back to label lookup
+        return None, None
+    if hits is None:
+        return None, None
+    hits = list(dict.fromkeys(hits))
+    if len(hits) == 1:
+        return hits, None
+    if not hits:
+        return [], (f"No AL symbol matches the path {label!r}. Check the object name and"
+                    " member names, or list members with bcatlas_get_outline.")
+    return [], ("Ambiguous AL symbol path; add the object type or id:\n"
+                + "\n".join(f"  {al_symbol_path(G, h)}  [id: {h}]" for h in hits[:20]))
 
 
 def _find_node(G: nx.Graph, label: str) -> list[str]:
@@ -2148,9 +2139,11 @@ def _build_server(
                 inputSchema={
                     "type": "object",
                     "properties": {
-                        "label": {"type": "string"},
+                        "label": {"type": "string", "description": _LABEL_DESCRIPTION},
                         "relation_filter": {"type": "string", "description": "Optional: filter by relation type"},
                         "token_budget": {"type": "integer", "default": 2000, "description": "Max output tokens"},
+                        "format": {"type": "string", "enum": ["compact", "full"],
+                                   "description": "compact: grouped by relation, one symbol path per neighbor"},
                         **_ROUTING_SCHEMA_PROPERTIES,
                     },
                     "required": ["label"],
@@ -2169,7 +2162,7 @@ def _build_server(
                 inputSchema={
                     "type": "object",
                     "properties": {
-                        "label": {"type": "string", "description": "Node label or ID to look up"},
+                        "label": {"type": "string", "description": _LABEL_DESCRIPTION},
                         **_ROUTING_SCHEMA_PROPERTIES,
                     },
                     "required": ["label"],
@@ -2187,7 +2180,9 @@ def _build_server(
                 inputSchema={
                     "type": "object",
                     "properties": {
-                        "label": {"type": "string", "description": "Node label or ID to look up"},
+                        "label": {"type": "string", "description": _LABEL_DESCRIPTION},
+                        "with_location": {"type": "boolean",
+                                          "description": "Prefix a line with the symbol path, file and line range"},
                         **_ROUTING_SCHEMA_PROPERTIES,
                     },
                     "required": ["label"],
@@ -2205,7 +2200,30 @@ def _build_server(
                 inputSchema={
                     "type": "object",
                     "properties": {
-                        "label": {"type": "string", "description": "Node label or ID to look up"},
+                        "label": {"type": "string", "description": _LABEL_DESCRIPTION},
+                        "max_lines": {"type": "integer",
+                                      "description": "Return the outline instead when the object is longer; 0 = no limit"},
+                        **_ROUTING_SCHEMA_PROPERTIES,
+                    },
+                    "required": ["label"],
+                },
+            ),
+            types.Tool(
+                name="bcatlas_get_outline",
+                description=(
+                    "Table of contents of an AL object with line ranges, read from"
+                    " the current source: procedures, triggers, fields (with their"
+                    " triggers) and event publishers. Use it instead of reading a"
+                    " whole object; filter with pattern."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "label": {"type": "string", "description": _LABEL_DESCRIPTION},
+                        "pattern": {"type": "string", "description": "Case-insensitive name filter across all sections"},
+                        "section": {"type": "string",
+                                    "enum": ["summary", "procedures", "triggers", "fields", "events", "all"],
+                                    "default": "summary"},
                         **_ROUTING_SCHEMA_PROPERTIES,
                     },
                     "required": ["label"],
@@ -2530,15 +2548,16 @@ def _build_server(
         except _RoutingError as exc:
             return str(exc)
         G = ctx.G
-        label = arguments["label"].lower()
         rel_filter = arguments.get("relation_filter", "").lower()
-        matches = _find_node(G, label)
-        if not matches:
-            return f"No node matching '{label}' found."
-        rivals = find_node_ambiguity(G, label)
-        if len(rivals) > 1:
-            return _ambiguity_message(G, rivals)
-        nid = matches[0]
+        nid, err = _pick_node(G, arguments["label"])
+        if err:
+            return err
+        budget = int(arguments.get("token_budget", 2000))
+        fmt = str(arguments.get("format") or ("compact" if precision_mode() else "full")).lower()
+        if fmt == "compact":
+            return _cut_lines_to_budget(
+                compact_neighbors(G, nid, rel_filter).split("\n"), budget,
+                "Narrow with relation_filter")
         lines = [f"Neighbors of {_qualified_label(G, nid)} [id: {sanitize_label(nid)}]:"]
         def _edge_at(d: dict) -> str:
             # Edge location = the relation SITE (call/import line) in the source
@@ -2568,32 +2587,51 @@ def _build_server(
                 f"[{sanitize_label(str(rel))}] [{sanitize_label(str(d.get('confidence', '')))}]"
                 f" [id: {sanitize_label(nb)}]{_edge_at(d)}"
             )
-        budget = int(arguments.get("token_budget", 2000))
         return _cut_lines_to_budget(
             lines, budget, "Narrow with relation_filter or use get_node for a specific symbol"
         )
 
-    def _tool_source_lookup(ctx: _RoutedGraph, label: str, fn) -> str:
-        matches = _find_node(ctx.G, label.lower())
+    def _pick_node(G, raw_label: str) -> tuple[str | None, str | None]:
+        """One node for a tool's `label`: an AL symbol path first
+        (`Table "Sales Line".Quantity.OnValidate`), else the fuzzy label/ID
+        lookup with its ambiguity check. Returns (nid, None) or (None, message)."""
+        hits, err = _al_path_lookup(G, raw_label)
+        if hits is not None:
+            return (hits[0], None) if hits else (None, err)
+        label = raw_label.lower()
+        matches = _find_node(G, label)
         if not matches:
-            return f"No node matching '{label}' found."
-        rivals = find_node_ambiguity(ctx.G, label.lower())
+            return None, f"No node matching '{label}' found."
+        rivals = find_node_ambiguity(G, label)
         if len(rivals) > 1:
-            return _ambiguity_message(ctx.G, rivals)
-        nid = matches[0]
+            return None, _ambiguity_message(G, rivals)
+        return matches[0], None
+
+    def _source_target(ctx: _RoutedGraph, label: str):
+        """(nid, source_path, expected_name, None) or (None, None, None, message)."""
+        nid, err = _pick_node(ctx.G, label)
+        if err:
+            return None, None, None, err
         d = ctx.G.nodes[nid]
         source_file = d.get("source_file") or ""
         if not source_file:
-            return f"Node '{sanitize_label(d.get('label', nid))}' has no associated source file."
+            return None, None, None, f"Node '{sanitize_label(d.get('label', nid))}' has no associated source file."
         try:
             source_path = validate_graph_path(ctx.source_root / source_file, base=ctx.source_root)
         except FileNotFoundError:
-            return f"Source file not found on disk: {source_file}"
+            return None, None, None, f"Source file not found on disk: {source_file}"
         except ValueError:
-            return f"Source path escapes the indexed source root: {source_file}"
+            return None, None, None, f"Source path escapes the indexed source root: {source_file}"
         expected = al_expected_name(ctx.G, nid) if source_file.lower().endswith(".al") else None
+        return nid, source_path, expected, None
+
+    def _tool_source_lookup(ctx: _RoutedGraph, label: str, fn, **kwargs) -> str:
+        nid, source_path, expected, err = _source_target(ctx, label)
+        if err:
+            return err
         try:
-            return fn(source_path, d.get("source_location"), expected_name=expected)
+            return fn(source_path, ctx.G.nodes[nid].get("source_location"),
+                      expected_name=expected, **kwargs)
         except source_lookup.SourceLookupError as exc:
             return str(exc)
 
@@ -2609,14 +2647,50 @@ def _build_server(
             ctx = _resolve_ctx(arguments)
         except _RoutingError as exc:
             return str(exc)
-        return _tool_source_lookup(ctx, arguments["label"], source_lookup.get_procedure_body)
+        with_location = arguments.get("with_location")
+        if with_location is None:
+            with_location = precision_mode()
+        if not with_location:
+            return _tool_source_lookup(ctx, arguments["label"], source_lookup.get_procedure_body)
+        nid, source_path, expected, err = _source_target(ctx, arguments["label"])
+        if err:
+            return err
+        d = ctx.G.nodes[nid]
+        try:
+            text, ranges = source_lookup.get_procedure_body_located(
+                source_path, d.get("source_location"), expected_name=expected)
+        except source_lookup.SourceLookupError as exc:
+            return str(exc)
+        where = ", ".join(f"L{a}-{b}" for a, b in ranges)
+        return f"// {al_symbol_path(ctx.G, nid)} | {d.get('source_file', '')} {where}\n{text}"
 
     def _tool_get_object_source(arguments: dict) -> str:
         try:
             ctx = _resolve_ctx(arguments)
         except _RoutingError as exc:
             return str(exc)
-        return _tool_source_lookup(ctx, arguments["label"], source_lookup.get_object_source)
+        max_lines = arguments.get("max_lines")
+        if max_lines is None:
+            max_lines = 400 if precision_mode() else 0
+        text = _tool_source_lookup(ctx, arguments["label"], source_lookup.get_object_source)
+        n_lines = text.count("\n") + 1
+        if not max_lines or n_lines <= int(max_lines):
+            return text
+        outline = _tool_source_lookup(ctx, arguments["label"], source_lookup.get_outline)
+        return (f"// Object source is {n_lines} lines, over max_lines={max_lines}; returning its"
+                " outline instead. Fetch members with bcatlas_get_procedure_body, filter with"
+                " bcatlas_get_outline(pattern=...), or pass max_lines=0 for the whole object.\n"
+                + outline)
+
+    def _tool_get_outline(arguments: dict) -> str:
+        try:
+            ctx = _resolve_ctx(arguments)
+        except _RoutingError as exc:
+            return str(exc)
+        return _tool_source_lookup(
+            ctx, arguments["label"], source_lookup.get_outline,
+            pattern=arguments.get("pattern") or None,
+            section=arguments.get("section") or "summary")
 
     def _tool_get_community(arguments: dict) -> str:
         try:
@@ -2770,6 +2844,7 @@ def _build_server(
         "bcatlas_get_signature": _tool_get_signature,
         "bcatlas_get_procedure_body": _tool_get_procedure_body,
         "bcatlas_get_object_source": _tool_get_object_source,
+        "bcatlas_get_outline": _tool_get_outline,
         "bcatlas_get_community": _tool_get_community,
         "bcatlas_god_nodes": _tool_god_nodes,
         "bcatlas_graph_stats": _tool_graph_stats,
