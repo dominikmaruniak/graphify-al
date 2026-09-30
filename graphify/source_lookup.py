@@ -7,7 +7,7 @@ from __future__ import annotations
 import importlib
 from pathlib import Path
 
-from graphify.extract import _AL_CONFIG
+from graphify.extract import _AL_CONFIG, _AL_MEMBER_TYPES, _al_member_name, _al_strip_quotes
 
 _parser = None
 
@@ -77,30 +77,111 @@ def _full_text(node, source: bytes) -> str:
     return source[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
 
 
-def _resolve_spans(source_path: Path, source_location: str | None) -> dict:
+def _decl_name(node, source: bytes) -> str | None:
+    name = node.child_by_field_name(_AL_CONFIG.name_field)
+    if name is None:
+        name = next((c for c in node.children
+                     if c.type in _AL_CONFIG.name_fallback_child_types), None)
+    if name is None:
+        return None
+    return _al_strip_quotes(source[name.start_byte:name.end_byte].decode("utf-8", errors="replace"))
+
+
+def _qualified_name(node, source: bytes) -> str | None:
+    """`Member.Name` path of a declaration inside its object: `InitQty` for a
+    procedure, `Quantity.OnValidate` for a field trigger. The object itself is
+    left out -- a source file holds one object."""
+    own = _decl_name(node, source)
+    if own is None:
+        return None
+    parts = [own]
+    anc = node.parent
+    while anc is not None and anc.type not in _AL_CONFIG.class_types:
+        if anc.type in _AL_MEMBER_TYPES:
+            member = _al_member_name(anc, source)
+            if member:
+                parts.append(_al_strip_quotes(member))
+        anc = anc.parent
+    return ".".join(reversed(parts))
+
+
+def _names_match(actual: str | None, expected: str) -> bool:
+    # Whole-path match only: a bare `OnValidate` must not pick one of a table's
+    # many field triggers.
+    return actual is not None and actual.lower() == expected.lower()
+
+
+def _enclosing_object(node):
+    anc = node.parent
+    while anc is not None and anc.type not in _AL_CONFIG.class_types:
+        anc = anc.parent
+    return anc
+
+
+def _find_declarations(node, source: bytes, expected: str, out: list) -> None:
+    if node.type in _AL_CONFIG.function_types:
+        if _names_match(_qualified_name(node, source), expected):
+            out.append(node)
+        return
+    for child in node.children:
+        _find_declarations(child, source, expected, out)
+
+
+def _resolve_spans(source_path: Path, source_location: str | None,
+                   expected_name: str | None = None) -> dict:
+    """Locate the declaration at `source_location`.
+
+    With `expected_name` (the declaration's `Member.Name` path, e.g.
+    `Quantity.OnValidate`), the match is verified: when the file drifted since
+    the graph was built and the stored line now sits in another declaration, the
+    file is searched for that name instead. One match is used; none or several
+    raise a "stale" SourceLookupError -- never another symbol's text."""
     line = _parse_line(source_location)
-    if line is None:
+    if line is None and expected_name is None:
         raise SourceLookupError("No source location recorded for this node.")
     if not source_path.is_file():
         raise SourceLookupError(f"Source file not found: {source_path}")
     source = source_path.read_bytes()
     tree = _get_parser().parse(source)
-    ctx: dict = {"object": None, "function": None}
-    _collect_spans(tree.root_node, line, ctx)
-    ctx["source"] = source
-    return ctx
+    ctx: dict = {"object": None, "function": None, "source": source, "moved": False}
+    if line is not None:
+        _collect_spans(tree.root_node, line, ctx)
+    if expected_name is None:
+        return ctx
+    current = ctx["function"]
+    if current is not None and _names_match(_qualified_name(current, source), expected_name):
+        return ctx
+    if current is None and ctx["object"] is not None and \
+            _names_match(_decl_name(ctx["object"], source), expected_name):
+        return ctx
+    found: list = []
+    _find_declarations(tree.root_node, source, expected_name, found)
+    if len(found) == 1:
+        ctx["function"] = found[0]
+        ctx["object"] = _enclosing_object(found[0])
+        ctx["moved"] = True
+        return ctx
+    where = (f" (candidates at lines {', '.join(str(n.start_point[0] + 1) for n in found)})"
+             if found else "")
+    raise SourceLookupError(
+        f"Graph anchor is stale: '{expected_name}' is no longer at {source_location}"
+        f" in {source_path.name} and could not be relocated unambiguously{where}."
+        " Rebuild the graph for this file."
+    )
 
 
-def get_signature(source_path: Path, source_location: str | None) -> str:
-    spans = _resolve_spans(source_path, source_location)
+def get_signature(source_path: Path, source_location: str | None,
+                  expected_name: str | None = None) -> str:
+    spans = _resolve_spans(source_path, source_location, expected_name)
     node = spans["function"] or spans["object"]
     if node is None:
         raise SourceLookupError("No object or procedure declaration found at that location.")
     return _header_text(node, spans["source"])
 
 
-def get_procedure_body(source_path: Path, source_location: str | None) -> str:
-    spans = _resolve_spans(source_path, source_location)
+def get_procedure_body(source_path: Path, source_location: str | None,
+                       expected_name: str | None = None) -> str:
+    spans = _resolve_spans(source_path, source_location, expected_name)
     if spans["function"] is None:
         raise SourceLookupError(
             "This node isn't inside a procedure/trigger -- use get_object_source instead."
@@ -108,8 +189,9 @@ def get_procedure_body(source_path: Path, source_location: str | None) -> str:
     return _full_text(spans["function"], spans["source"])
 
 
-def get_object_source(source_path: Path, source_location: str | None) -> str:
-    spans = _resolve_spans(source_path, source_location)
+def get_object_source(source_path: Path, source_location: str | None,
+                      expected_name: str | None = None) -> str:
+    spans = _resolve_spans(source_path, source_location, expected_name)
     if spans["object"] is not None:
         return _full_text(spans["object"], spans["source"])
     # source_location sits above any declaration (e.g. the file-level node) --

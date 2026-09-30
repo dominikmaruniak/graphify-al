@@ -1675,6 +1675,45 @@ def _find_node_by_global_id(G: nx.Graph, global_id: str) -> list[str]:
     ]
 
 
+def _al_bare_member(label: str) -> str:
+    """`.InitQty()` -> `InitQty`, `."Quantity (Base)"` -> `Quantity (Base)`."""
+    s = label[1:] if label.startswith(".") else label
+    if s.endswith("()"):
+        s = s[:-2]
+    s = s.strip()
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        s = s[1:-1]
+    return s
+
+
+def al_expected_name(G: nx.Graph, nid: str) -> str | None:
+    """`Member.Name` path of an AL procedure/trigger node, built from the graph
+    (`Quantity.OnValidate` for a field trigger, `InitQty` for a procedure).
+
+    source_lookup verifies the declaration it finds at the stored line against
+    this path and relocates or refuses on a mismatch, so a file that drifted
+    since the graph was built never returns another symbol's text. Object and
+    file nodes return None -- any line inside the one object of an AL file
+    resolves to that object."""
+    label = str(G.nodes[nid].get("label") or "")
+    if not label.startswith("."):
+        return None
+    parts = [_al_bare_member(label)]
+    current = nid
+    for _ in range(8):
+        owner = next(
+            (p for p in G.predecessors(current)
+             if edge_data(G, p, current).get("relation") in ("contains", "trigger")
+             and str(G.nodes[p].get("label") or "").startswith(".")),
+            None,
+        )
+        if owner is None:
+            break
+        parts.append(_al_bare_member(str(G.nodes[owner].get("label"))))
+        current = owner
+    return ".".join(reversed(parts))
+
+
 def _find_node(G: nx.Graph, label: str) -> list[str]:
     """Return node IDs whose label or ID matches the search term (diacritic-insensitive).
 
@@ -2552,8 +2591,9 @@ def _build_server(
             return f"Source file not found on disk: {source_file}"
         except ValueError:
             return f"Source path escapes the indexed source root: {source_file}"
+        expected = al_expected_name(ctx.G, nid) if source_file.lower().endswith(".al") else None
         try:
-            return fn(source_path, d.get("source_location"))
+            return fn(source_path, d.get("source_location"), expected_name=expected)
         except source_lookup.SourceLookupError as exc:
             return str(exc)
 
