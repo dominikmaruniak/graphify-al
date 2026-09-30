@@ -144,6 +144,51 @@ def test_graph_anchor_survives_drift_end_to_end(tmp_path: Path) -> None:
         assert body.startswith(head)
 
 
+OVERLOADS = (
+    "codeunit 50100 \"My Mgt\"\n"                             # 1
+    "{\n"                                                     # 2
+    "    procedure GetHeader(var H: Record Customer)\n"       # 3
+    "    begin\n"                                             # 4
+    "        H.Get('A');\n"                                   # 5
+    "    end;\n"                                              # 6
+    "\n"                                                      # 7
+    "    procedure GetHeader(var H: Record Customer; No: Code[20])\n"  # 8
+    "    begin\n"                                             # 9
+    "        H.Get(No);\n"                                    # 10
+    "    end;\n"                                              # 11
+    "}\n"                                                     # 12
+)
+
+
+def test_overload_group_returns_every_overload(tmp_path: Path) -> None:
+    """Overloads share one graph node (same id), so its source is all of them."""
+    p = _write(tmp_path, OVERLOADS)
+
+    body = get_procedure_body(p, "L3", expected_name="GetHeader")
+
+    assert body.startswith("// 2 overloads of GetHeader: L3, L8")
+    assert "H.Get('A');" in body and "H.Get(No);" in body
+
+
+def test_overload_group_after_drift_lands_on_second_overload(tmp_path: Path) -> None:
+    """A 5-line shift puts overload #2 at overload #1's old line: a name check
+    alone would pass and return half the group."""
+    p = _write(tmp_path, _drifted(OVERLOADS, lines_above=5, at_line=3))
+
+    body = get_procedure_body(p, "L8", expected_name="GetHeader")
+
+    assert "H.Get('A');" in body and "H.Get(No);" in body
+
+
+def test_overload_group_signatures(tmp_path: Path) -> None:
+    p = _write(tmp_path, OVERLOADS)
+
+    assert get_signature(p, "L3", expected_name="GetHeader") == (
+        "procedure GetHeader(var H: Record Customer)\n"
+        "procedure GetHeader(var H: Record Customer; No: Code[20])"
+    )
+
+
 def test_missing_symbol_raises_stale_instead_of_guessing(tmp_path: Path) -> None:
     p = _write(tmp_path, TABLE.replace("InitQty()\n    begin", "InitQuantity()\n    begin"))
 

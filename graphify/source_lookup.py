@@ -132,10 +132,12 @@ def _resolve_spans(source_path: Path, source_location: str | None,
     """Locate the declaration at `source_location`.
 
     With `expected_name` (the declaration's `Member.Name` path, e.g.
-    `Quantity.OnValidate`), the match is verified: when the file drifted since
-    the graph was built and the stored line now sits in another declaration, the
-    file is searched for that name instead. One match is used; none or several
-    raise a "stale" SourceLookupError -- never another symbol's text."""
+    `Quantity.OnValidate`), the file is searched for every declaration with that
+    path instead of trusting the stored line, which goes stale as soon as the
+    file changes after the graph was built. `group` holds all of them: AL
+    overloads share one graph node id, so the node stands for the whole
+    overload group. No match raises a "stale" SourceLookupError -- never another
+    symbol's text."""
     line = _parse_line(source_location)
     if line is None and expected_name is None:
         raise SourceLookupError("No source location recorded for this node.")
@@ -143,36 +145,41 @@ def _resolve_spans(source_path: Path, source_location: str | None,
         raise SourceLookupError(f"Source file not found: {source_path}")
     source = source_path.read_bytes()
     tree = _get_parser().parse(source)
-    ctx: dict = {"object": None, "function": None, "source": source, "moved": False}
+    ctx: dict = {"object": None, "function": None, "source": source, "moved": False, "group": []}
     if line is not None:
         _collect_spans(tree.root_node, line, ctx)
     if expected_name is None:
         return ctx
-    current = ctx["function"]
-    if current is not None and _names_match(_qualified_name(current, source), expected_name):
-        return ctx
-    if current is None and ctx["object"] is not None and \
-            _names_match(_decl_name(ctx["object"], source), expected_name):
-        return ctx
     found: list = []
     _find_declarations(tree.root_node, source, expected_name, found)
-    if len(found) == 1:
-        ctx["function"] = found[0]
-        ctx["object"] = _enclosing_object(found[0])
-        ctx["moved"] = True
+    if found:
+        ctx["group"] = found
+        current = ctx["function"]
+        if current is None or all(n.start_byte != current.start_byte for n in found):
+            ctx["function"] = found[0]
+            ctx["object"] = _enclosing_object(found[0])
+            ctx["moved"] = True
         return ctx
-    where = (f" (candidates at lines {', '.join(str(n.start_point[0] + 1) for n in found)})"
-             if found else "")
+    if ctx["function"] is None and ctx["object"] is not None and \
+            _names_match(_decl_name(ctx["object"], source), expected_name):
+        return ctx
     raise SourceLookupError(
-        f"Graph anchor is stale: '{expected_name}' is no longer at {source_location}"
-        f" in {source_path.name} and could not be relocated unambiguously{where}."
-        " Rebuild the graph for this file."
+        f"Graph anchor is stale: '{expected_name}' is no longer in {source_path.name}"
+        f" (graph location {source_location}). Rebuild the graph for this file."
     )
+
+
+def _group_note(spans: dict, expected_name: str | None) -> str:
+    group = spans["group"]
+    lines = ", ".join(f"L{n.start_point[0] + 1}" for n in group)
+    return f"// {len(group)} overloads of {expected_name}: {lines}\n"
 
 
 def get_signature(source_path: Path, source_location: str | None,
                   expected_name: str | None = None) -> str:
     spans = _resolve_spans(source_path, source_location, expected_name)
+    if len(spans["group"]) > 1:
+        return "\n".join(_header_text(n, spans["source"]) for n in spans["group"])
     node = spans["function"] or spans["object"]
     if node is None:
         raise SourceLookupError("No object or procedure declaration found at that location.")
@@ -182,6 +189,9 @@ def get_signature(source_path: Path, source_location: str | None,
 def get_procedure_body(source_path: Path, source_location: str | None,
                        expected_name: str | None = None) -> str:
     spans = _resolve_spans(source_path, source_location, expected_name)
+    if len(spans["group"]) > 1:
+        return _group_note(spans, expected_name) + "\n\n".join(
+            _full_text(n, spans["source"]) for n in spans["group"])
     if spans["function"] is None:
         raise SourceLookupError(
             "This node isn't inside a procedure/trigger -- use get_object_source instead."
