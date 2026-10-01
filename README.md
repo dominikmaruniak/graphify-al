@@ -1,12 +1,143 @@
-<!--
-  AL FORK of safishamsi/graphify — adds Microsoft Dynamics 365 Business Central (AL)
-  support. See AL_SUPPORT.md for what's added and how to use it. Upstream README follows.
--->
+# graphify-al · AL precision retrieval for coding agents
 
-> **This is an AL/Business Central fork of [graphify](https://github.com/safishamsi/graphify).**
-> It adds `.al` language support (objects, procedures, cross-object calls, event
-> subscriptions, extension targets). See **[AL_SUPPORT.md](AL_SUPPORT.md)**. Everything
-> below is the upstream README.
+**Branch `al-precision-retrieval`** of [dominikmaruniak/graphify-al](https://github.com/dominikmaruniak/graphify-al).
+
+This branch turns graphify's code graph into a precise lookup service for **Microsoft Dynamics 365 Business Central (AL)** code. A coding agent such as Claude Code connects to it over MCP. Instead of grepping and reading whole files, the agent asks structural questions directly:
+- who calls this procedure, and through which overload;
+- which events does this field validation raise, and who subscribes to them;
+- what runs when a Customer record is deleted;
+- give me the exact source of this trigger.
+
+The answers come from a graph of your own AL code. The exact source is always re-read from disk.
+
+> The rest of this file, below the line, is the upstream graphify README. The AL layer is described in [AL_SUPPORT.md](AL_SUPPORT.md).
+
+## What it is
+
+- **A graph builder** for AL source folders: a Base Application, your extensions, or both together. `graphify update <folder>` parses every `.al` file with tree-sitter and writes `graphify-out/graph.json`. The graph holds objects, fields, procedures, triggers, calls, event publishers, subscriptions, extensions, table relations and more. Builds run entirely locally, need no LLM or API key, and are incremental.
+- **An MCP server** (`python -m graphify.serve <graph.json>`) that exposes `bcatlas_*` tools to the agent. With `GRAPHIFY_AL_PRECISION=1` the server runs in **precision mode**, which this branch adds:
+  - symbol paths written the way AL developers name things (`Table 37 "Sales Line".Quantity.OnValidate`);
+  - compact answers;
+  - exact source verified against the symbol it claims to be.
+
+## How it works
+
+1. **Parse.** [tree-sitter-al](https://github.com/SShadowS/tree-sitter-al) produces a syntax tree for each `.al` file.
+2. **Extract.** graphify's generic extractor and the AL semantic layer (`graphify/extract.py`: `_al_collect_facts`, `_resolve_al_facts`) turn the trees into nodes and edges. Calls resolve through typed `Codeunit`/`Record`/`Interface` variables, `Rec`/`xRec`, `Codeunit.Run(Codeunit::"X")`, interface dispatch, and nested field and action triggers. AL identifiers are matched case-insensitively.
+3. **Serve.** The MCP server loads the graph. About 11 s and 1.2 GB RAM for the whole Base Application.
+4. **Answer.**
+
+| Tool | Answers |
+|---|---|
+| `bcatlas_resolve_node` | Where is this object, field, procedure, trigger or event? Implicit platform events resolve too (`member='OnAfterDeleteEvent'`). |
+| `bcatlas_get_neighbors` | Callers and callees. For a trigger, every raised event with its subscribers. Callers of an overloaded procedure split per overload by argument count. For a table, its implicit events that have subscribers. |
+| `bcatlas_get_procedure_body` | The exact source of one procedure or trigger, re-read from the file and checked against the symbol path. If the file changed since the graph was built, it reports a stale anchor and never returns another procedure's code. |
+| `bcatlas_get_signature` | Declaration headers, all overloads. |
+| `bcatlas_get_outline` | Table of contents of a large object with line ranges. `lines=[...]` maps grep hits to the procedure or trigger that contains each one. |
+| `bcatlas_get_object_source` | The whole object. Objects over 400 lines return the outline instead. |
+
+## What it is built on
+
+| Project | What this branch uses from it |
+|---|---|
+| [safishamsi/graphify](https://github.com/safishamsi/graphify) (Safi Shamsi and contributors, Apache-2.0/MIT) | The whole engine: tree-sitter extraction pipeline, graph build, incremental cache, CLI, MCP server and the generic query tools. |
+| [ChristianHovenbitzer/graphify-al](https://github.com/ChristianHovenbitzer/graphify-al) (Christian Hovenbitzer) | The AL semantic layer: AL objects and members, cross-object call resolution, event subscriptions, extends/binds/relations, external stubs, `resolve_node`, and the ambiguity-aware node lookup. |
+| [StefanMaron/graphify-al](https://github.com/StefanMaron/graphify-al), branch `bc-code-atlas-fixes` (Stefan Maron) | The base of this branch (8ee3d6b): the `bcatlas_*` tool set and the source tools (signature, procedure body, object source); country/version/`global_id` routing for the hosted bc-code-atlas service; the tree-sitter-al 4.x upgrade and many AL fixes. |
+| [SShadowS/tree-sitter-al](https://github.com/SShadowS/tree-sitter-al) (MIT) | The AL grammar, as a normal Python dependency. |
+| [modelcontextprotocol/python-sdk](https://github.com/modelcontextprotocol/python-sdk) | The MCP server transport. |
+| [StefanMaron/MSDyn365BC.Sandbox.Code.History](https://github.com/StefanMaron/MSDyn365BC.Sandbox.Code.History) | Not a dependency. It is a convenient source of Base Application code per country and version (for example branch `w1-28` or `pl-28`) to index next to your own apps. |
+
+## What this branch adds
+
+Each change was made to fix a measured loss (see *Benchmarks*).
+
+| Commit | Change |
+|---|---|
+| f866ebe | Source lookups verify the declaration against the node's symbol path, so a graph that drifted from the files never returns a foreign body. |
+| 6b035da | A procedure node stands for its whole overload group. |
+| d88479b | Precision mode: AL symbol paths, compact grouped neighbors (`raises` separate from `calls`), `get_outline`, size caps for object source. |
+| 2fbb456, 01fec33 | Calls through `Record`-typed variables, `Rec`/`xRec`, and calls inside nested field and action triggers resolve to table procedures. |
+| 7f2d6f4, 56689db | Dotted member names (`"No."`) round-trip in symbol paths. The core tools load up front in Claude Code, so there is no ToolSearch turn. |
+| a4c68ea | Implicit platform events get their own nodes, and subscriptions keep event and element names. AL calls resolve case-insensitively, which adds 59 call edges in Base App w1-28 that were missing. |
+| bdd8f45 | `get_neighbors` lists raised events with their subscribers and splits callers per overload by argument count, re-read from the call sites. |
+| 79ef83c | `get_outline(lines=[...])` maps line numbers to their enclosing member. |
+| 97c20b8 | In precision mode `format=full` starts with the compact view. |
+
+The tests for these changes are in `tests/test_al_precision_tools.py`, `tests/test_al_neighbors_enriched.py`, `tests/test_al_implicit_events.py`, `tests/test_al_record_method_calls.py` and `tests/test_al_source_anchor_drift.py`.
+
+## How it differs from other options
+
+| Option | Difference |
+|---|---|
+| **Plain Claude Code (grep + read)** | It answers correctly too: in our tests accuracy did not separate the options. This branch costs about 25% less per session and reads about 2.5× less source. See *Benchmarks*. |
+| **Upstream graphify-al / bc-code-atlas server** (same tools, no precision mode) | In our blind test it cost slightly *more* than plain grep: 1.06×, because of extra turns and large results. It returns label-matched nodes rather than symbol paths. It trusts stored line numbers, which drifted on the public instance (a body lookup returned a different procedure). |
+| **bc-code-atlas hosted instance** | Prebuilt graphs of Microsoft's standard code per country and version. It cannot see your extensions. This branch runs locally on any folder, so your apps and Base App can share one graph, and subscribers in your code show up next to Microsoft's. |
+| **AL Language extension / AL language server** | The right tool for exact references and renames inside the editor. It is not built for an agent's multi-hop questions (field trigger → events → subscribers → bodies). This branch does not replace it. |
+| **AL-Dependency-MCP-Server** | Reads compiled `.app` symbols: object and member signatures, without procedure bodies, call edges or event subscribers. |
+| **Embedding / RAG search** | Fuzzy similarity over chunks. This branch is a deterministic graph with exact, verified source. |
+| **Context compression (e.g. DensePack)** | Shrinks text that was already retrieved. It complements precise retrieval rather than replacing it. |
+
+## Benchmarks
+
+The benchmark used headless Claude Code sessions (Opus 5.5) on Base Application w1-28. The questions are realistic development tasks: negatives ("it doesn't exist"), false leads (same-named procedures and events in other objects), no matching tool (implicit events, field writes, IsHandled points) and multi-hop chains. Ground truth comes from regex over the source plus manual reading, fixed before any run. Answers were scored for completeness, decoys, verbatim code and unknown identifiers, with a blind review of every negative and explanation answer.
+
+| Set | Plain grep | Upstream graphify-al | This branch |
+|---|---|---|---|
+| Blind set, 15 questions, first version (56689db) | 15/15, $3.35 | 15/15, $3.55 | 15/15, $2.97 (0.89×) |
+| Same 15 questions, current version (97c20b8), n=2 | 15/15, $3.35 | – | 15/15, $2.46 (0.74×, 95% CI 0.67–0.81) |
+| **Held-out set, 10 new questions, current version** | 10/10, $1.81 | – | **10/10, $1.36 (0.75×, 95% CI 0.67–0.87)** |
+
+On the held-out set, this branch also used 0.86× the tool calls and 0.39× the source characters of plain grep. Wall time was 1.12×, because the server starts in about 10 s.
+
+**Limits:**
+- One corpus, one model, English prompts.
+- n = 1–2 per question.
+- The same author wrote the questions and this branch.
+- No configuration ever produced fabricated code, so the benchmark measures cost and efficiency, not answer quality.
+
+## Quick start (Windows PowerShell; other platforms work the same way)
+
+```powershell
+git clone -b al-precision-retrieval https://github.com/dominikmaruniak/graphify-al.git C:\tools\graphify-al
+cd C:\tools\graphify-al
+uv venv --python 3.12
+uv pip install -e ".[al,mcp]"
+
+# build a graph (use --no-cluster: the benchmarked graphs were built this way)
+$env:PYTHONUTF8 = "1"
+uv run --no-sync --project C:\tools\graphify-al python -m graphify update C:\src\MyApp --no-cluster
+```
+
+`.mcp.json` in your project:
+
+```json
+{
+  "mcpServers": {
+    "al": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "--no-sync", "--project", "C:\\tools\\graphify-al", "python", "-m", "graphify.serve",
+               "C:\\src\\MyApp\\graphify-out\\graph.json",
+               "--instructions", "Structural graph of the AL source in this folder. Use these tools to locate AL objects, procedures, triggers, fields, callers and event subscribers, and to fetch exact source."],
+      "env": { "PYTHONUTF8": "1", "GRAPHIFY_AL_PRECISION": "1" }
+    }
+  }
+}
+```
+
+The server reads source from the folder above `graphify-out`. If the graph lives elsewhere, pass `--source-root <folder>`. Rebuild the graph after code changes; if you forget, the source tools report a stale anchor. Keep extra `graph.json` copies out of the indexed folder, because agents grep them.
+
+**Limitations:**
+- Dynamic dispatch (`RecordRef`, `Codeunit.Run` with a variable id, manually bound subscribers) is not visible.
+- Overloads with the same number of parameters are reported as ambiguous.
+- Objects outside the indexed folder are stubs without source.
+
+**Status:**
+- Not merged upstream. The source-drift and overload-group fixes are the first candidates for a PR to `StefanMaron/graphify-al`.
+- Extractor changes belong with the AL layer in `ChristianHovenbitzer/graphify-al`.
+
+---
+
 
 <p align="center">
   <a href="https://graphify.com"><img src="https://raw.githubusercontent.com/Graphify-Labs/graphify/v8/docs/logo.png" width="300" height="140" alt="Graphify"/></a>
