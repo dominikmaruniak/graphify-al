@@ -152,7 +152,8 @@ def test_compact_neighbors_splits_events_from_calls(graph, monkeypatch):
                 {"label": 'Table "Widget Line".Quantity.OnValidate', "format": "compact"})
     lines = out.splitlines()
     assert lines[0].startswith('Table 50100 "Widget Line".Quantity.OnValidate')
-    assert "raises (1): .OnBeforeValidateQuantity" in out
+    assert "raises (1; 0 with subscribers):" in out
+    assert "no subscribers in the graph: .OnBeforeValidateQuantity" in out
     assert "calls (1): .InitQty" in out
 
 

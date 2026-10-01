@@ -204,15 +204,37 @@ _IN_NAMES = {"calls": "called by", "subscribes": "subscribed by", "extends": "ex
              "references": "referenced by"}
 
 
+def _subscription_tag(edge: dict) -> str:
+    """` [OnAfterValidateEvent "No."]` for a subscription whose event is not the target node."""
+    ev = str(edge.get("event") or "")
+    if not ev:
+        return ""
+    el = str(edge.get("element") or "")
+    return f" [{ev}{' ' + repr(el) if el else ''}]"
+
+
+def _subscribers(G: nx.Graph, nid: str) -> list[str]:
+    return [p for p in G.predecessors(nid) if edge_data(G, p, nid).get("relation") == "subscribes"]
+
+
 def compact_neighbors(G: nx.Graph, nid: str, relation_filter: str = "",
-                      max_per_relation: int = 60) -> str:
+                      max_per_relation: int = 60, overloads=None) -> str:
     """Neighbors grouped by relation, one line each, every neighbor printed once
     as a symbol path (`.Name` when it lives in the same object as the seed).
-    Calls into event publishers are listed separately as `raises`."""
+
+    Calls into event publishers are listed as `raises`, each with the procedures
+    that subscribe to it, so "which of these events have subscribers" is one call.
+    A subscription landing on a field or object keeps its event name, an object
+    lists the implicit platform events (`OnAfterDeleteEvent`, ...) that have
+    subscribers, and `overloads` (from al_overloads.callers_by_overload) splits
+    `called by` per overload of an overloaded procedure."""
     seed_obj = al_object_of(G, nid)
     d = G.nodes[nid]
     loc = f"{d.get('source_file', '')} {d.get('source_location', '')}".strip()
-    lines = [f"{al_symbol_path(G, nid)}  [{loc}]"]
+    head = al_symbol_path(G, nid)
+    if d.get("event") == "implicit":
+        head += "  (implicit platform event: no AL declaration or body)"
+    lines = [f"{head}  [{loc}]"]
 
     def ref(other: str) -> str:
         if seed_obj is not None and al_object_of(G, other) == seed_obj and other != seed_obj:
@@ -222,25 +244,65 @@ def compact_neighbors(G: nx.Graph, nid: str, relation_filter: str = "",
         return al_symbol_path(G, other)
 
     groups: dict[str, list[str]] = {}
+    raised: list[str] = []
+    implicit: list[str] = []
     member_counts: dict[str, int] = {}
     for nb in G.successors(nid):
         rel = str(edge_data(G, nid, nb).get("relation", ""))
         if rel in _OWNER_RELATIONS and not _label(G, nid).startswith("."):
+            if G.nodes[nb].get("event") == "implicit":
+                implicit.append(nb)
+                continue
             kind = "fields/members" if rel == "contains" else ("triggers" if rel == "trigger" else "procedures")
             member_counts[kind] = member_counts.get(kind, 0) + 1
             continue
         if rel == "calls" and G.nodes[nb].get("event"):
-            rel = "raises"
+            raised.append(nb)
+            continue
         groups.setdefault(rel, []).append(ref(nb))
+    callers: list[str] = []
     for nb in G.predecessors(nid):
-        rel = str(edge_data(G, nb, nid).get("relation", ""))
+        e = edge_data(G, nb, nid)
+        rel = str(e.get("relation", ""))
         if rel in _OWNER_RELATIONS:
             continue
-        groups.setdefault(_IN_NAMES.get(rel, f"{rel} (in)"), []).append(ref(nb))
+        if rel == "calls" and overloads is not None:
+            callers.append(nb)
+            continue
+        tag = _subscription_tag(e) if rel == "subscribes" and not _label(G, nid).endswith("()") else ""
+        groups.setdefault(_IN_NAMES.get(rel, f"{rel} (in)"), []).append(ref(nb) + tag)
     if member_counts:
         lines.append("members: " + ", ".join(f"{v} {k}" for k, v in member_counts.items())
                      + "  (list them with bcatlas_get_outline)")
     rf = relation_filter.lower()
+    if implicit and (not rf or rf in "subscribed by implicit events"):
+        parts = sorted(((len(_subscribers(G, i)), _al_bare_member(_label(G, i))) for i in implicit),
+                       key=lambda t: (-t[0], t[1]))
+        lines.append("implicit events with subscribers: "
+                     + ", ".join(f"{name} ({n})" for n, name in parts)
+                     + "  (get_neighbors on the event, e.g. " + al_symbol_path(G, implicit[0]) + ")")
+    if raised and (not rf or rf in "raises subscribed by"):
+        uniq = list(dict.fromkeys(raised))
+        with_subs = [(ev, _subscribers(G, ev)) for ev in uniq]
+        hit = [(ev, subs) for ev, subs in with_subs if subs]
+        lines.append(f"raises ({len(uniq)}; {len(hit)} with subscribers):")
+        for ev, subs in hit:
+            lines.append(f"  {ref(ev)} <- " + ", ".join(al_symbol_path(G, s) for s in subs))
+        quiet = [ref(ev) for ev, subs in with_subs if not subs]
+        if quiet:
+            lines.append("  no subscribers in the graph: " + ", ".join(quiet))
+    if callers and (not rf or rf in "called by"):
+        overload_decls, per_caller = overloads
+        uniq = list(dict.fromkeys(callers))
+        lines.append(f"called by ({len(uniq)}), split by overload (argument count at the call site):")
+        for line, n, _header in overload_decls:
+            same = [o for o in overload_decls if o[1] == n]
+            who = [ref(c) for c in uniq if n in per_caller.get(c, [None])]
+            tag = f"{n} params" if len(same) == 1 else f"{n} params, ambiguous: {len(same)} overloads"
+            lines.append(f"  L{line} ({tag}): " + (", ".join(who) if who else "-"))
+        unknown = [ref(c) for c in uniq if None in per_caller.get(c, [None])]
+        if unknown:
+            lines.append("  overload not determined: " + ", ".join(unknown))
     for rel, refs in groups.items():
         if rf and rf not in rel.lower():
             continue

@@ -18,6 +18,7 @@ from graphify.build import edge_data, edge_datas
 from graphify.al_precision import (  # noqa: F401 -- al_expected_name is re-exported
     al_expected_name, al_symbol_path, compact_neighbors, precision_mode, resolve_symbol_path,
 )
+from graphify.al_overloads import callers_by_overload
 from graphify.paths import default_graph_json as _default_graph_json
 from graphify import source_lookup
 
@@ -2100,7 +2101,9 @@ def _build_server(
                     " bcatlas_get_neighbors to traverse. PREFER this over"
                     " bcatlas_get_node whenever you know what kind of thing you"
                     " are looking for (bcatlas_get_node is fuzzy and may return a"
-                    " similarly named page control instead of the table)."
+                    " similarly named page control instead of the table). Implicit"
+                    " platform events resolve too: member='OnAfterDeleteEvent'"
+                    " (Insert/Modify/Delete/Rename, OnOpenPageEvent, ...)."
                 ),
                 inputSchema={
                     "type": "object",
@@ -2145,9 +2148,13 @@ def _build_server(
                     "Direct neighbors of a node: what it calls, who calls it, which"
                     " subscribers handle an event, which triggers call a procedure."
                     " Answers 'who calls X' / 'what does X call' / 'who subscribes to"
-                    " event X' in one call. Calls are resolved statically (typed"
-                    " Codeunit/Record/Interface variables, Rec, Codeunit.Run); dynamic"
-                    " dispatch is not visible."
+                    " event X' in one call. For a procedure or trigger, 'raises' lists"
+                    " every event it raises with that event's subscribers; callers of"
+                    " an overloaded procedure are split per overload by argument"
+                    " count; an object lists its implicit events (OnAfterDeleteEvent,"
+                    " ...) that have subscribers. Calls are resolved statically"
+                    " (typed Codeunit/Record/Interface variables, Rec, Codeunit.Run);"
+                    " dynamic dispatch is not visible."
                 ),
                 inputSchema={
                     "type": "object",
@@ -2574,8 +2581,14 @@ def _build_server(
         budget = int(arguments.get("token_budget", 2000))
         fmt = str(arguments.get("format") or ("compact" if precision_mode() else "full")).lower()
         if fmt == "compact":
+            overloads = None
+            if str(G.nodes[nid].get("label", "")).endswith("()"):
+                try:
+                    overloads = callers_by_overload(G, nid, ctx.source_root)
+                except Exception:  # noqa: BLE001 -- the split is a refinement; never fail the lookup
+                    overloads = None
             return _cut_lines_to_budget(
-                compact_neighbors(G, nid, rel_filter).split("\n"), budget,
+                compact_neighbors(G, nid, rel_filter, overloads=overloads).split("\n"), budget,
                 "Narrow with relation_filter")
         lines = [f"Neighbors of {_qualified_label(G, nid)} [id: {sanitize_label(nid)}]:"]
         def _edge_at(d: dict) -> str:
@@ -2632,6 +2645,11 @@ def _build_server(
         if err:
             return None, None, None, err
         d = ctx.G.nodes[nid]
+        if d.get("event") == "implicit":
+            path = al_symbol_path(ctx.G, nid)
+            return None, None, None, (
+                f"{path} is an implicit platform event: the object never declares it, so it has"
+                f" no AL source. Its subscribers: bcatlas_get_neighbors(label='{path}').")
         source_file = d.get("source_file") or ""
         if not source_file:
             return None, None, None, f"Node '{sanitize_label(d.get('label', nid))}' has no associated source file."
