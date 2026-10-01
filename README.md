@@ -45,7 +45,7 @@ The answers come from a graph of your own AL code. The exact source is always re
 | [StefanMaron/graphify-al](https://github.com/StefanMaron/graphify-al), branch `bc-code-atlas-fixes` (Stefan Maron) | The base of this branch (8ee3d6b): the `bcatlas_*` tool set and the source tools (signature, procedure body, object source); country/version/`global_id` routing for the hosted bc-code-atlas service; the tree-sitter-al 4.x upgrade and many AL fixes. |
 | [SShadowS/tree-sitter-al](https://github.com/SShadowS/tree-sitter-al) (MIT) | The AL grammar, as a normal Python dependency. |
 | [modelcontextprotocol/python-sdk](https://github.com/modelcontextprotocol/python-sdk) | The MCP server transport. |
-| [StefanMaron/MSDyn365BC.Sandbox.Code.History](https://github.com/StefanMaron/MSDyn365BC.Sandbox.Code.History) | Not a dependency. It is a convenient source of Base Application code per country and version (for example branch `w1-28` or `pl-28`) to index next to your own apps. |
+| [StefanMaron/MSDyn365BC.Sandbox.Code.History](https://github.com/StefanMaron/MSDyn365BC.Sandbox.Code.History) | Not a dependency. It is an alternative source of Base Application code per version (for example branch `w1-28`) when a project's `.alpackages` are not at hand. Countries that Microsoft does not localize, such as Poland, have no source on their branches; use `w1`. |
 
 ## What this branch adds
 
@@ -62,6 +62,7 @@ Each change was made to fix a measured loss (see *Benchmarks*).
 | bdd8f45 | `get_neighbors` lists raised events with their subscribers and splits callers per overload by argument count, re-read from the call sites. |
 | 79ef83c | `get_outline(lines=[...])` maps line numbers to their enclosing member. |
 | 97c20b8 | In precision mode `format=full` starts with the compact view. |
+| al_packages | `python -m graphify.al_packages` extracts AL source from a project's `.alpackages`, so Base App and partner dependencies are indexed at the exact versions the project compiles against. |
 
 The tests for these changes are in `tests/test_al_precision_tools.py`, `tests/test_al_neighbors_enriched.py`, `tests/test_al_implicit_events.py`, `tests/test_al_record_method_calls.py` and `tests/test_al_source_anchor_drift.py`.
 
@@ -124,6 +125,16 @@ uv run --no-sync --project C:\tools\graphify-al python -m graphify update C:\src
   }
 }
 ```
+
+**Dependencies (Base App, System Application, partner apps).** An `.app` package is a 40-byte NAVX header followed by a zip. Microsoft apps, and partner apps that expose their code, carry the full AL source. Extract it from the project's own `.alpackages` (run *AL: Download symbols* first) and build a second graph:
+
+```powershell
+uv run --no-sync --project C:\tools\graphify-al python -m graphify.al_packages C:\src\MyApp\.alpackages C:\al-deps\MyApp
+$env:GRAPHIFY_OUT = "C:\al-graphs\MyApp-deps"
+uv run --no-sync --project C:\tools\graphify-al python -m graphify update C:\al-deps\MyApp --no-cluster
+```
+
+Packages without source (symbols only) are skipped and reported. When the folder holds several versions of one app, the newest is used. Add a second server entry for this graph with `"--source-root", "C:\\al-deps\\MyApp"`. `GRAPHIFY_OUT` also works for your app's graph if you want to keep `graphify-out` out of the repository.
 
 The server reads source from the folder above `graphify-out`. If the graph lives elsewhere, pass `--source-root <folder>`. Rebuild the graph after code changes; if you forget, the source tools report a stale anchor. Keep extra `graph.json` copies out of the indexed folder, because agents grep them.
 
