@@ -3847,6 +3847,10 @@ def _extract_generic(
                     tgt_nid = None
                 else:
                     tgt_nid = label_to_nid.get(callee_name)
+                    if tgt_nid is None and callee_name and config.ts_module == "tree_sitter_al":
+                        # AL identifiers are case-insensitive: a call spelled
+                        # `...UnitOfMeasureCode(` reaches `procedure ...UnitOfmeasureCode`.
+                        tgt_nid = label_to_nid_ci.get(callee_name.lower())
                 if tgt_nid and tgt_nid != caller_nid:
                     pair = (caller_nid, tgt_nid)
                     if pair not in seen_call_pairs:
@@ -5440,6 +5444,15 @@ def _al_parse_rolecenter(prop_text: str):
     return _al_strip_quotes(m.group(1)) if m else None
 
 
+# Platform events every table/page raises without declaring them.
+_AL_IMPLICIT_EVENT_RE = re.compile(
+    r"^On(Before|After)(Insert|Modify|Delete|Rename|Validate)Event$"
+    r"|^On(Open|Close|QueryClose)PageEvent$"
+    r"|^On(AfterGetRecord|AfterGetCurrRecord|NewRecord|InsertRecord|ModifyRecord|DeleteRecord)Event$"
+    r"|^On(Before|After)ActionEvent$|^OnLookupEvent$|^OnDrillDownEvent$|^OnAssistEditEvent$",
+    re.IGNORECASE)
+
+
 def _al_parse_event_subscriber(attr_text: str):
     if "eventsubscriber" not in attr_text.lower():
         return None
@@ -6590,6 +6603,35 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
     new_nodes: list[dict] = []
     ext_cache: dict[tuple, str] = {}
     existing_ids: set = {n["id"] for n in all_nodes}
+    implicit_cache: dict[tuple, str] = {}
+    implicit_edges: list[dict] = []
+
+    def ensure_implicit_event(obj_id: str, event: str) -> str:
+        """Member node for a platform event the object never declares
+        (`OnAfterDeleteEvent`, `OnOpenPageEvent`, ...), so its subscribers hang
+        off `Table "Customer".OnAfterDeleteEvent` instead of the whole table."""
+        key = (obj_id, event.lower())
+        if key in implicit_cache:
+            return implicit_cache[key]
+        nid = _make_id(obj_id, event)
+        if nid in existing_ids:
+            nid = _make_id(obj_id, event, "implicit")
+        obj = objnode_by_id.get(obj_id, {})
+        node = {"id": nid, "label": f".{event}()", "file_type": "code",
+                "source_file": obj.get("source_file", ""),
+                "source_location": obj.get("source_location", "L1"),
+                "event": "implicit", "_origin": "al_implicit_event"}
+        if obj.get("al_owning_app"):
+            node["al_owning_app"] = obj["al_owning_app"]
+        new_nodes.append(node)
+        existing_ids.add(nid)
+        implicit_edges.append({
+            "source": obj_id, "target": nid, "relation": "method",
+            "confidence": "EXTRACTED", "source_file": node["source_file"],
+            "source_location": node["source_location"], "weight": 1.0,
+            "_origin": "al_implicit_event"})
+        implicit_cache[key] = nid
+        return nid
 
     def ensure_external(label: str, qualifier: str = "", obj_type: str = "") -> str:
         # Dedup is by (type, name), not name alone (#31): BC allows a table and a
@@ -6954,13 +6996,22 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
                     ev_raw = str(f.get("event", "")).strip()
                     evname = ev_raw.lower()
                     fldname = str(f.get("field", "")).strip()
+                    # A table and a codeunit may share a name; the attribute's
+                    # ObjectType says which one publishes the event.
+                    tkind = str(f.get("target_kind", "")).lower()
+                    obj_id = next((i for i in obj_ids_by_name.get(key, [])
+                                   if objnode_by_id.get(i, {}).get("al_object_type") == tkind),
+                                  obj_id)
                     if fldname and "validate" in evname:
                         # OnBefore/OnAfterValidateEvent's 4th arg names the field;
                         # resolve to that field's node so the subscription attaches
                         # to the field, not the whole table.
                         tgt = resolve_field(tname, fldname)
                     elif obj_id:
-                        tgt = proc_by_objmeth.get((obj_id, evname), obj_id) if evname else obj_id
+                        tgt = proc_by_objmeth.get((obj_id, evname)) if evname else None
+                        if tgt is None and _AL_IMPLICIT_EVENT_RE.match(ev_raw):
+                            tgt = ensure_implicit_event(obj_id, ev_raw)
+                        tgt = tgt or obj_id
                     elif ev_raw:
                         # #31/#33: same per-member stub treatment as `calls`
                         # above, for a subscription onto an out-of-corpus
@@ -6995,9 +7046,15 @@ def _resolve_al_facts(per_file, all_nodes: list[dict]) -> list[dict]:
                 edge["al_object_kind"] = f.get("obj_kind", "")
             if f["kind"] == "sub_page" and f.get("sub_page_link"):
                 edge["sub_page_link"] = f["sub_page_link"]  # SubPageLink linkage
+            if f["kind"] == "subscribes":
+                # Keep the attribute's event and element names on the edge: a
+                # subscription that lands on an object or field node loses them.
+                edge["event"] = str(f.get("event", "")).strip()
+                if f.get("field"):
+                    edge["element"] = str(f["field"]).strip()
             new_edges.append(edge)
     all_nodes.extend(new_nodes)
-    return new_edges
+    return new_edges + implicit_edges
 
 
 def extract_al(path: Path) -> dict:
