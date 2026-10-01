@@ -237,3 +237,17 @@ def test_object_source_over_max_lines_returns_outline(graph):
 def test_object_source_zero_max_lines_returns_everything(graph):
     out = _call(graph, "bcatlas_get_object_source", {"label": 'Table "Widget Line"', "max_lines": 0})
     assert out.startswith('table 50100 "Widget Line"') and out.rstrip().endswith("}")
+
+
+def test_outline_maps_lines_to_enclosing_members(graph):
+    src = _TABLE.splitlines()
+    in_trigger = next(i for i, s in enumerate(src, 1) if "OnBeforeValidateQuantity(Rec);" in s)
+    in_proc = next(i for i, s in enumerate(src, 1) if "Message('init');" in s)
+    out = _call(graph, "bcatlas_get_outline",
+                {"label": 'Table "Widget Line"', "lines": [in_trigger, in_proc, 2, 9999]})
+    rows = out.splitlines()[1:]
+    assert rows[0] == f"L{in_trigger} -> trigger Quantity.OnValidate" + rows[0].split("OnValidate", 1)[1]
+    assert rows[1].startswith(f"L{in_proc} -> procedure InitQty  L")
+    assert "object level" in rows[2]
+    assert "outside this object" in rows[3]
+    assert len(out) < 400

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import importlib
+import re
 from pathlib import Path
 
 from graphify.extract import _AL_CONFIG, _AL_MEMBER_TYPES, _al_member_name, _al_strip_quotes
@@ -277,13 +278,47 @@ def _outline_entries(obj, source: bytes) -> tuple[list[dict], list[dict]]:
     return decls, fields
 
 
+def _parse_lines(lines) -> list[int]:
+    """[728, 2738] from a list of ints/strings or a string such as 'L728, 2738'."""
+    if lines is None:
+        return []
+    items = lines if isinstance(lines, (list, tuple)) else re.split(r"[\s,;]+", str(lines))
+    out = []
+    for it in items:
+        m = re.fullmatch(r"L?(\d+)", str(it).strip())
+        if m:
+            out.append(int(m.group(1)))
+    return out
+
+
+def _locate_lines(header: str, source_path: Path, start: int, end: int,
+                  decls: list[dict], fields: list[dict], wanted: list[int]) -> str:
+    out = [f"{header}  [{source_path.name} L{start}-{end}]"]
+    for ln in wanted:
+        inner = min((d for d in decls if d["start"] <= ln <= d["end"]),
+                    key=lambda d: d["end"] - d["start"], default=None)
+        if inner is not None:
+            out.append(f"L{ln} -> {inner['kind']} {inner['name']}  L{inner['start']}-{inner['end']}")
+            continue
+        fld = next((f for f in fields if f["start"] <= ln <= f["end"]), None)
+        if fld is not None:
+            out.append(f"L{ln} -> field {fld['name']}  L{fld['start']}-{fld['end']} (declaration)")
+        elif start <= ln <= end:
+            out.append(f"L{ln} -> object level (not inside a procedure, trigger or field)")
+        else:
+            out.append(f"L{ln} -> outside this object (L{start}-{end})")
+    return "\n".join(out)
+
+
 def get_outline(source_path: Path, source_location: str | None,
                 expected_name: str | None = None, pattern: str | None = None,
-                section: str = "summary", max_items: int = 300) -> str:
+                section: str = "summary", max_items: int = 300, lines=None) -> str:
     """Table of contents of the AL object at `source_location`: its procedures,
     triggers, fields and event publishers with 1-based line ranges, read from the
     current file (so it is never stale). `summary` gives counts and object
-    triggers only; `pattern` filters by name across every section."""
+    triggers only; `pattern` filters by name across every section. `lines`
+    (e.g. grep hits) maps each line number to the innermost procedure, trigger or
+    field that contains it, one row per line, instead of listing a section."""
     spans = _resolve_spans(source_path, source_location, expected_name)
     obj, source = spans["object"], spans["source"]
     if obj is None:
@@ -296,6 +331,9 @@ def get_outline(source_path: Path, source_location: str | None,
     decls, fields = _outline_entries(obj, source)
     start, end = _lines(obj)
     header = _one_line(_header_text(obj, source).split("\n", 1)[0])
+    wanted = _parse_lines(lines)
+    if wanted:
+        return _locate_lines(header, source_path, start, end, decls, fields, wanted)
     procs = [d for d in decls if d["kind"] == "procedure" and not d["event"]]
     events = [d for d in decls if d["event"]]
     obj_triggers = [d for d in decls if d["kind"] == "trigger" and not d["member_trigger"]]

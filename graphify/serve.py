@@ -2235,13 +2235,17 @@ def _build_server(
                     "Table of contents of an AL object with line ranges, read from"
                     " the current source: procedures, triggers, fields (with their"
                     " triggers) and event publishers. Use it instead of reading a"
-                    " whole object; filter with pattern."
+                    " whole object; filter with pattern. Pass lines (e.g. the line"
+                    " numbers of grep hits in this object's file) to get only the"
+                    " procedure or trigger that contains each line."
                 ),
                 inputSchema={
                     "type": "object",
                     "properties": {
                         "label": {"type": "string", "description": _LABEL_DESCRIPTION},
                         "pattern": {"type": "string", "description": "Case-insensitive name filter across all sections"},
+                        "lines": {"type": "array", "items": {"type": "integer"},
+                                  "description": "Line numbers to map to their enclosing procedure/trigger/field"},
                         "section": {"type": "string",
                                     "enum": ["summary", "procedures", "triggers", "fields", "events", "all"],
                                     "default": "summary"},
@@ -2727,7 +2731,8 @@ def _build_server(
         return _tool_source_lookup(
             ctx, arguments["label"], source_lookup.get_outline,
             pattern=arguments.get("pattern") or None,
-            section=arguments.get("section") or "summary")
+            section=arguments.get("section") or "summary",
+            lines=arguments.get("lines"))
 
     def _tool_get_community(arguments: dict) -> str:
         try:
