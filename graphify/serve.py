@@ -2163,7 +2163,10 @@ def _build_server(
                         "relation_filter": {"type": "string", "description": "Optional: filter by relation type"},
                         "token_budget": {"type": "integer", "default": 2000, "description": "Max output tokens"},
                         "format": {"type": "string", "enum": ["compact", "full"],
-                                   "description": "compact: grouped by relation, one symbol path per neighbor"},
+                                   "description": ("compact (the usual choice): grouped by relation, one symbol"
+                                                   " path per neighbor, callers split per overload, implicit"
+                                                   " events listed. full: the same, followed by one line per"
+                                                   " edge with node ids and source locations")},
                         **_ROUTING_SCHEMA_PROPERTIES,
                     },
                     "required": ["label"],
@@ -2584,17 +2587,22 @@ def _build_server(
             return err
         budget = int(arguments.get("token_budget", 2000))
         fmt = str(arguments.get("format") or ("compact" if precision_mode() else "full")).lower()
-        if fmt == "compact":
+
+        def _compact() -> list[str]:
             overloads = None
             if str(G.nodes[nid].get("label", "")).endswith("()"):
                 try:
                     overloads = callers_by_overload(G, nid, ctx.source_root)
                 except Exception:  # noqa: BLE001 -- the split is a refinement; never fail the lookup
                     overloads = None
-            return _cut_lines_to_budget(
-                compact_neighbors(G, nid, rel_filter, overloads=overloads).split("\n"), budget,
-                "Narrow with relation_filter")
-        lines = [f"Neighbors of {_qualified_label(G, nid)} [id: {sanitize_label(nid)}]:"]
+            return compact_neighbors(G, nid, rel_filter, overloads=overloads).split("\n")
+
+        if fmt == "compact":
+            return _cut_lines_to_budget(_compact(), budget, "Narrow with relation_filter")
+        # In precision mode the full edge list follows the compact view, so asking for
+        # format=full never loses subscribers, the per-overload callers or implicit events.
+        lines = (_compact() + ["", "Edges:"]) if precision_mode() else []
+        lines.append(f"Neighbors of {_qualified_label(G, nid)} [id: {sanitize_label(nid)}]:")
         def _edge_at(d: dict) -> str:
             # Edge location = the relation SITE (call/import line) in the source
             # node's file, not a def line (#BUG1).

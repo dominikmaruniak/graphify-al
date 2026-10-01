@@ -185,3 +185,18 @@ def test_param_and_argument_counts():
     body = "X.Calc(1, StrSubstNo('%1,%2', 3, 4));\n// Calc(9, 9, 9);\nCalc();\nY.Calc(Arr[1, 2])"
     counts = call_arg_counts(body, "Calc", lambda v: {"X": True, "Y": None}.get(v, False), True)
     assert counts == [2, 0, None]
+
+
+def test_full_format_starts_with_the_compact_view_in_precision_mode(graph, monkeypatch):
+    monkeypatch.setenv("GRAPHIFY_AL_PRECISION", "1")
+    out = _call(graph, "bcatlas_get_neighbors", {"label": '"Gizmo"."No.".OnValidate', "format": "full"})
+    assert "raises (2; 1 with subscribers):" in out
+    assert "Edges:" in out and "-->" in out
+    calc = _call(graph, "bcatlas_get_neighbors", {"label": '"Gizmo".Calc', "format": "full"})
+    assert "split by overload" in calc and "<--" in calc
+
+
+def test_full_format_without_precision_mode_is_unchanged(graph, monkeypatch):
+    monkeypatch.delenv("GRAPHIFY_AL_PRECISION", raising=False)
+    out = _call(graph, "bcatlas_get_neighbors", {"label": '"Gizmo"."No.".OnValidate', "format": "full"})
+    assert out.startswith("Neighbors of") and "raises (" not in out
